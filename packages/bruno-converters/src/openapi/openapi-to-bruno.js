@@ -1,0 +1,1298 @@
+import each from 'lodash/each';
+import get from 'lodash/get';
+import isPlainObject from 'lodash/isPlainObject';
+import omit from 'lodash/omit';
+import uniq from 'lodash/uniq';
+import jsyaml from 'js-yaml';
+import { validateSchema, transformItemsInCollection, hydrateSeqInCollection, uuid, sanitizeTag, sanitizeTags } from '../common';
+import { swagger2ToBruno } from './swagger2-to-bruno';
+import { allowedDefault, resolveSchemaComposition, registerComponentNames, registerReferencePlaceholder } from './schema-composition';
+import {
+  ensureUrl,
+  BODY_TYPE_HANDLERS,
+  getExampleFromSchema,
+  getExpandableObjectSchema,
+  resetExampleGenerationState,
+  createBrunoExample,
+  groupRequestsByTags,
+  groupRequestsByPath,
+  normalizeItemName,
+  getRequestName,
+  getTagDescriptions,
+  toSpecString,
+  operationSchemeName,
+  optsOutOfAuth,
+  inheritsCollectionAuth,
+  resolveCollectionAuthScheme
+} from './openapi-common';
+
+const getContentLevelExample = (bodyContent) => {
+  if (bodyContent.example !== undefined) return bodyContent.example;
+  const firstExample = Object.values(bodyContent.examples ?? {})[0];
+  return firstExample?.value;
+};
+
+// Extract a representative value from a schema property (used for request body properties)
+// Priority: prop.example > parentExample[propName] > prop.default > prop.enum[0] > ''
+const getSchemaPropertyExampleValue = (prop, propName, parentExample = {}) => {
+  if (prop.example !== undefined) return String(prop.example);
+  if (parentExample[propName] !== undefined) return String(parentExample[propName]);
+  if (prop.default !== undefined) return String(prop.default);
+  if (prop.enum && prop.enum.length > 0) return String(prop.enum[0]);
+  return '';
+};
+
+const withoutObjectValues = (schema) => {
+  if (!schema || typeof schema !== 'object') return schema;
+  const objectValued = ['example', 'default'].filter((keyword) => isPlainObject(schema[keyword]));
+  return objectValued.length > 0 ? omit(schema, objectValued) : schema;
+};
+
+const resolveParameterSchema = (rawSchema) => {
+  const schema = resolveSchemaComposition(rawSchema || {}) || {};
+  const items = resolveSchemaComposition(schema.items);
+  return items === schema.items ? schema : { ...schema, items: withoutObjectValues(items) };
+};
+
+const serializeParamValue = (value) => {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  if (typeof value !== 'object') {
+    return String(value);
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return String(value);
+  }
+};
+
+const queryMemberDelimiter = (style) => {
+  if (style === 'pipeDelimited') return '|';
+  if (style === 'spaceDelimited') return ' ';
+  return ',';
+};
+
+const paramEntriesFromValue = (val, param) => {
+  const isQueryParam = param.in === 'query' || param.in === 'querystring';
+  const usesFormStyle = isQueryParam && (param.style === undefined || param.style === 'form');
+  const explode = typeof param.explode === 'boolean' ? param.explode : usesFormStyle;
+  const delimiter = isQueryParam ? queryMemberDelimiter(param.style) : ',';
+
+  if (Array.isArray(val)) {
+    if (!val.length) {
+      return null;
+    }
+
+    const members = val.map(serializeParamValue);
+
+    return usesFormStyle && explode
+      ? members.map((value) => ({ value, enabled: true }))
+      : [{ value: members.join(delimiter), enabled: true }];
+  }
+
+  if (val !== null && typeof val === 'object') {
+    const pairs = Object.entries(val);
+    if (!pairs.length) {
+      return null;
+    }
+
+    if (usesFormStyle && explode) {
+      return pairs.map(([key, item]) => ({ name: key, value: serializeParamValue(item), enabled: true }));
+    }
+
+    const flattened = explode
+      ? pairs.map(([key, item]) => `${key}=${serializeParamValue(item)}`)
+      : pairs.flatMap(([key, item]) => [key, serializeParamValue(item)]);
+
+    return [{ value: flattened.join(delimiter), enabled: true }];
+  }
+
+  const value = serializeParamValue(val);
+
+  return value === '' ? null : [{ value, enabled: true }];
+};
+
+const namedExampleValue = (example) => {
+  if (!example || typeof example !== 'object') {
+    return undefined;
+  }
+
+  return example.dataValue !== undefined ? example.dataValue : example.value;
+};
+
+const declaredParamValues = (param, schema) => {
+  const namedExampleValues = Object.values(param.examples || {}).map(namedExampleValue);
+
+  return [
+    param.example,
+    ...namedExampleValues,
+    schema.default,
+    schema.example,
+    Array.isArray(schema.examples) ? schema.examples[0] : undefined
+  ];
+};
+
+const entriesFromDeclaredValues = (param, schema) => {
+  for (const value of declaredParamValues(param, schema)) {
+    if (value === undefined) {
+      continue;
+    }
+
+    const entries = paramEntriesFromValue(value, param);
+    if (entries) {
+      return entries;
+    }
+  }
+
+  return null;
+};
+
+/**
+ * @param {Object} param - The OpenAPI parameter object
+ * @param {*} [fallbackValue] - Value to use once every source the spec declares has come up empty
+ * @returns {Array} - Entries of `{ value, enabled }`, plus `name` where a member overrides it
+ */
+const getParameterEntries = (param, fallbackValue) => {
+  const schema = resolveParameterSchema(param.schema);
+  const entries = [];
+
+  // Handle enum parameters - create entry for each enum value
+  if (schema.enum && Array.isArray(schema.enum) && schema.enum.length > 0) {
+    const defaultValue = schema.default !== undefined ? String(schema.default) : null;
+
+    schema.enum.forEach((enumValue) => {
+      const valueStr = String(enumValue);
+      // Enable only if it matches the default value, or if it's the first value and required
+      const isDefault = defaultValue !== null && valueStr === defaultValue;
+      const enabled = isDefault || (defaultValue === null && schema.enum.indexOf(enumValue) === 0 && !!param.required);
+
+      entries.push({
+        value: valueStr,
+        enabled: enabled
+      });
+    });
+
+    return entries;
+  }
+
+  // Handle array type with items schema that has enum
+  if (schema.type === 'array' && schema.items && schema.items.enum && Array.isArray(schema.items.enum) && schema.items.enum.length > 0) {
+    const defaultValue = schema.items.default !== undefined ? String(schema.items.default) : null;
+
+    const declaredEntries = entriesFromDeclaredValues(param, schema);
+    if (declaredEntries) {
+      return declaredEntries;
+    }
+
+    // Otherwise, create entries for each enum value in items
+    schema.items.enum.forEach((enumValue) => {
+      const valueStr = String(enumValue);
+      const isDefault = defaultValue !== null && valueStr === defaultValue;
+      const enabled = isDefault || (defaultValue === null && schema.items.enum.indexOf(enumValue) === 0 && !!param.required);
+
+      entries.push({
+        value: valueStr,
+        enabled: enabled
+      });
+    });
+
+    return entries;
+  }
+
+  const declaredEntries = entriesFromDeclaredValues(param, schema);
+  if (declaredEntries) {
+    return declaredEntries;
+  }
+
+  let enabled = param.required || declaredParamValues(param, schema).some((value) => value !== undefined);
+
+  if (fallbackValue !== undefined) {
+    const fallbackEntries = paramEntriesFromValue(fallbackValue, param);
+    if (fallbackEntries) {
+      return fallbackEntries;
+    }
+  }
+
+  if (schema.nullable === true && !param.required) {
+    enabled = false;
+  } else if (param.allowEmptyValue === true && !param.required) {
+    enabled = false;
+  }
+
+  if (schema.type === 'array' && schema.items) {
+    let value;
+    if (schema.items.example !== undefined) {
+      value = String(schema.items.example);
+    } else if (schema.items.enum && schema.items.enum.length > 0) {
+      value = String(schema.items.enum[0]);
+    } else if (schema.items.default !== undefined) {
+      value = String(schema.items.default);
+    } else {
+      value = '';
+    }
+    return [{ value, enabled }];
+  }
+
+  if (schema.minimum !== undefined) {
+    return [{ value: String(allowedDefault(schema, schema.minimum)), enabled }];
+  }
+
+  return [{ value: param.required ? String(allowedDefault(schema, '') ?? '') : '', enabled }];
+};
+
+const declaresValue = (schema) =>
+  schema.example !== undefined
+  || schema.default !== undefined
+  || (Array.isArray(schema.examples) && schema.examples.length > 0)
+  || (Array.isArray(schema.enum) && schema.enum.length > 0);
+
+const objectValueFromSchema = (param, schema) => {
+  const schemaExample = schema.example || {};
+  const value = {};
+
+  each(schema.properties, (rawProp, propName) => {
+    const prop = resolveSchemaComposition(rawProp) || {};
+    const propSchema = (prop.example === undefined && schemaExample[propName] !== undefined)
+      ? { ...prop, example: schemaExample[propName] }
+      : prop;
+    const isRequired = Array.isArray(schema.required) && schema.required.includes(propName);
+    const entries = getParameterEntries({
+      ...param, example: undefined, examples: undefined, name: propName, schema: propSchema, required: isRequired
+    });
+
+    const picked = entries.find((entry) => entry.enabled) || entries[0];
+
+    if (picked && (picked.value !== '' || declaresValue(propSchema))) {
+      value[propName] = picked.value;
+    }
+  });
+
+  return value;
+};
+
+const transformOpenapiRequestItem = (request, usedNames = new Set(), options = {}) => {
+  let _operationObject = request.operationObject;
+
+  const { name: operationName, filename } = getRequestName(request, options.requestNameSource, usedNames);
+
+  // replace OpenAPI links in path by Bruno variables
+  let path = request.path.replace(/{([a-zA-Z]+)}/g, `{{${_operationObject.operationId}_$1}}`);
+
+  const brunoRequestItem = {
+    uid: uuid(),
+    name: operationName,
+    ...(filename && { filename }),
+    type: 'http-request',
+    settings: {
+      forwardAuthorizationHeader: false
+    },
+    tags: sanitizeTags(request.operationObject.tags || [], options),
+    request: {
+      docs: toSpecString(_operationObject.description),
+      url: ensureUrl(request.global.server + path),
+      method: request.method.toUpperCase(),
+      auth: {
+        mode: 'inherit',
+        basic: null,
+        bearer: null,
+        digest: null,
+        apikey: null,
+        oauth2: null
+      },
+      headers: [],
+      params: [],
+      body: {
+        mode: 'none',
+        json: null,
+        text: null,
+        xml: null,
+        formUrlEncoded: [],
+        multipartForm: []
+      },
+      script: {
+        res: null
+      }
+    }
+  };
+
+  // If the operation has its own servers, override baseUrl via request vars
+  // Only the first server is used; Bruno supports a single baseUrl per request
+  if (request.servers && request.servers.length > 0) {
+    const serverVarPairs = extractServerVars(request.servers[0]);
+    brunoRequestItem.request.vars = {
+      req: serverVarPairs.filter((sv) => !sv.secret).map((sv) => ({
+        uid: uuid(),
+        name: sv.name,
+        value: sv.value,
+        enabled: true,
+        local: false
+      })),
+      res: []
+    };
+  }
+
+  each(_operationObject.parameters || [], (param) => {
+    const paramSchema = getExpandableObjectSchema(param);
+    const expandsIntoOwnParams = paramSchema && (param.in === 'query' || param.in === 'querystring');
+
+    if (expandsIntoOwnParams) {
+      // Expand object schema properties into individual parameters
+      const schemaExample = paramSchema.example || {};
+
+      each(paramSchema.properties, (rawProp, propName) => {
+        const prop = resolveSchemaComposition(rawProp) || {};
+        const isRequired = Array.isArray(paramSchema.required) && paramSchema.required.includes(propName);
+
+        // Create a temporary parameter object for getParameterEntries
+        // Enrich property with parent example context if property lacks its own example
+        // Use child-level example only; drop parent-level example/examples to avoid
+        // object-level values leaking into scalar child parameters
+        const propSchema = (prop.example === undefined && schemaExample[propName] !== undefined)
+          ? { ...prop, example: schemaExample[propName] }
+          : prop;
+        const tempParam = { ...param, example: undefined, examples: undefined, name: propName, schema: propSchema, required: isRequired };
+        const entries = getParameterEntries(tempParam);
+
+        entries.forEach((entry) => {
+          if (param.in === 'query' || param.in === 'querystring') {
+            brunoRequestItem.request.params.push({
+              uid: uuid(),
+              name: propName,
+              value: entry.value,
+              description: prop.description || '',
+              enabled: entry.enabled,
+              type: 'query'
+            });
+          } else if (param.in === 'path') {
+            brunoRequestItem.request.params.push({
+              uid: uuid(),
+              name: propName,
+              value: entry.value,
+              description: prop.description || '',
+              enabled: entry.enabled,
+              type: 'path'
+            });
+          } else if (param.in === 'header') {
+            brunoRequestItem.request.headers.push({
+              uid: uuid(),
+              name: propName,
+              value: entry.value,
+              description: prop.description || '',
+              enabled: entry.enabled
+            });
+          }
+        });
+      });
+    } else {
+      const entries = paramSchema
+        ? getParameterEntries(param, objectValueFromSchema(param, paramSchema))
+        : getParameterEntries(param);
+
+      entries.forEach((entry) => {
+        if (param.in === 'query' || param.in === 'querystring') {
+          brunoRequestItem.request.params.push({
+            uid: uuid(),
+            name: entry.name || param.name,
+            value: entry.value,
+            description: param.description || '',
+            enabled: entry.enabled,
+            type: 'query'
+          });
+        } else if (param.in === 'path') {
+          brunoRequestItem.request.params.push({
+            uid: uuid(),
+            name: entry.name || param.name,
+            value: entry.value,
+            description: param.description || '',
+            enabled: entry.enabled,
+            type: 'path'
+          });
+        } else if (param.in === 'header') {
+          brunoRequestItem.request.headers.push({
+            uid: uuid(),
+            name: entry.name || param.name,
+            value: entry.value,
+            description: param.description || '',
+            enabled: entry.enabled
+          });
+        }
+      });
+    }
+  });
+
+  const { collectionAuthScheme } = options;
+  const schemeName = operationSchemeName(_operationObject.security);
+
+  if (optsOutOfAuth(_operationObject.security, collectionAuthScheme)) {
+    brunoRequestItem.request.auth.mode = 'none';
+  }
+
+  const auth = inheritsCollectionAuth(_operationObject.security, collectionAuthScheme) ? null : request.global.security.getScheme(schemeName);
+
+  if (auth) {
+    if (auth.type === 'http' && auth.scheme === 'basic') {
+      brunoRequestItem.request.auth.mode = 'basic';
+      brunoRequestItem.request.auth.basic = {
+        username: '{{username}}',
+        password: '{{password}}'
+      };
+    } else if (auth.type === 'http' && auth.scheme === 'bearer') {
+      brunoRequestItem.request.auth.mode = 'bearer';
+      brunoRequestItem.request.auth.bearer = {
+        token: '{{token}}'
+      };
+    } else if (auth.type === 'http' && auth.scheme === 'digest') {
+      brunoRequestItem.request.auth.mode = 'digest';
+      brunoRequestItem.request.auth.digest = {
+        username: '{{username}}',
+        password: '{{password}}'
+      };
+    } else if (auth.type === 'apiKey') {
+      const apikeyConfig = {
+        key: auth.name,
+        value: '{{apiKey}}',
+        placement: auth.in === 'query' ? 'queryparams' : 'header'
+      };
+      brunoRequestItem.request.auth.mode = 'apikey';
+      brunoRequestItem.request.auth.apikey = apikeyConfig;
+
+      if (auth.in === 'header' || auth.in === 'cookie') {
+        brunoRequestItem.request.headers.push({
+          uid: uuid(),
+          name: auth.name,
+          value: '{{apiKey}}',
+          description: auth.description || '',
+          enabled: true
+        });
+      } else if (auth.in === 'query') {
+        brunoRequestItem.request.params.push({
+          uid: uuid(),
+          name: auth.name,
+          value: '{{apiKey}}',
+          description: auth.description || '',
+          enabled: true,
+          type: 'query'
+        });
+      }
+    } else if (auth.type === 'oauth2') {
+      // Determine flow (grant type)
+      let flows = auth.flows || {};
+      let grantType = 'client_credentials';
+      if (flows.authorizationCode) {
+        grantType = 'authorization_code';
+      } else if (flows.implicit) {
+        grantType = 'implicit';
+      } else if (flows.password) {
+        grantType = 'password';
+      } else if (flows.clientCredentials) {
+        grantType = 'client_credentials';
+      }
+
+      let flowConfig = {};
+      switch (grantType) {
+        case 'authorization_code':
+          flowConfig = flows.authorizationCode || {};
+          break;
+        case 'implicit':
+          flowConfig = flows.implicit || {};
+          break;
+        case 'password':
+          flowConfig = flows.password || {};
+          break;
+        case 'client_credentials':
+        default:
+          flowConfig = flows.clientCredentials || {};
+          break;
+      }
+
+      brunoRequestItem.request.auth.mode = 'oauth2';
+      brunoRequestItem.request.auth.oauth2 = {
+        grantType: grantType,
+        authorizationUrl: flowConfig.authorizationUrl || '{{oauth_authorize_url}}',
+        accessTokenUrl: flowConfig.tokenUrl || '{{oauth_token_url}}',
+        refreshTokenUrl: flowConfig.refreshUrl || '{{oauth_refresh_url}}',
+        callbackUrl: '{{oauth_callback_url}}',
+        clientId: '{{oauth_client_id}}',
+        clientSecret: '{{oauth_client_secret}}',
+        scope: Array.isArray(flowConfig.scopes) ? flowConfig.scopes.join(' ') : Object.keys(flowConfig.scopes || {}).join(' '),
+        state: '{{oauth_state}}',
+        credentialsPlacement: 'header',
+        tokenPlacement: 'header',
+        tokenHeaderPrefix: 'Bearer',
+        autoFetchToken: false,
+        autoRefreshToken: true
+      };
+    }
+  }
+
+  if (_operationObject.requestBody) {
+    const content = get(_operationObject, 'requestBody.content', {});
+    const mimeType = Object.keys(content)[0];
+    const bodyContent = content[mimeType] || {};
+    let bodySchema = bodyContent.schema;
+
+    if (bodySchema?.example === undefined) {
+      const contentExample = getContentLevelExample(bodyContent);
+      if (contentExample !== undefined) {
+        bodySchema = { ...bodySchema, example: contentExample };
+      }
+    }
+
+    // Normalize: lowercase (object keys may vary in case)
+    const normalizedMimeType = typeof mimeType === 'string' ? mimeType.toLowerCase() : '';
+
+    // Find matching handler for this content type
+    const handler = BODY_TYPE_HANDLERS.find((h) => h.match(normalizedMimeType));
+    if (handler) {
+      brunoRequestItem.request.body.mode = handler.mode;
+      handler.handle(brunoRequestItem.request.body, bodySchema);
+    }
+  }
+
+  // build the extraction scripts from responses that have links
+  // https://swagger.io/docs/specification/links/
+  let script = [];
+  each(_operationObject.responses || [], (response, responseStatus) => {
+    if (Object.hasOwn(response, 'links')) {
+      // only extract if the status code matches the response
+      script.push(`if (res.status === ${responseStatus}) {`);
+      each(response.links, (link) => {
+        each(link.parameters || [], (expression, parameter) => {
+          let value = openAPIRuntimeExpressionToScript(expression);
+          script.push(`  bru.setVar('${link.operationId}_${parameter}', ${value});`);
+        });
+      });
+      script.push(`}`);
+    }
+  });
+  if (script.length > 0) {
+    brunoRequestItem.request.script.res = script.join('\n');
+  }
+
+  // Handle OpenAPI examples from responses and request body
+  if (_operationObject.responses) {
+    const examples = [];
+
+    // Extract request body examples if they exist
+    // Unified structure: all request body data is stored as examples with contentType
+    const requestBodyExamples = [];
+
+    /**
+     * Helper function to create examples with appropriate request body handling
+     * @param {Object} params - Parameters object
+     * @param {*} params.responseExampleValue - The response example value
+     * @param {string} params.exampleName - Name of the example
+     * @param {string} params.exampleDescription - Description of the example
+     * @param {number} params.statusCode - HTTP status code
+     * @param {string} params.responseContentType - Response content type
+     * @param {string} [params.responseExampleKey] - Optional response example key for matching
+     */
+    const createExamplesWithRequestBody = ({ responseExampleValue, exampleName, exampleDescription, statusCode, responseContentType, responseExampleKey = null }) => {
+      const requestBodyExamplesWithKeys = requestBodyExamples.filter((rb) => rb.key !== null);
+      const requestBodyExamplesWithoutKeys = requestBodyExamples.filter((rb) => rb.key === null);
+
+      // Check if there's a matching request body example by key
+      const matchingRequestBodyExample = responseExampleKey
+        ? requestBodyExamplesWithKeys.find((rb) => rb.key === responseExampleKey)
+        : null;
+
+      if (matchingRequestBodyExample) {
+        // Use the matching request body example
+        examples.push(createBrunoExample({
+          brunoRequestItem,
+          exampleValue: responseExampleValue,
+          exampleName,
+          exampleDescription,
+          statusCode,
+          contentType: responseContentType,
+          requestBodySchema: matchingRequestBodyExample.schema,
+          requestBodyContentType: matchingRequestBodyExample.contentType
+        }));
+      } else if (requestBodyExamplesWithKeys.length > 0) {
+        // No match found, create all combinations with request body examples that have keys
+        requestBodyExamplesWithKeys.forEach((rbExample) => {
+          const combinedExampleName = `${exampleName} (${rbExample.summary || rbExample.key})`;
+          const combinedExampleDescription = exampleDescription || rbExample.description || '';
+          examples.push(createBrunoExample({
+            brunoRequestItem,
+            exampleValue: responseExampleValue,
+            exampleName: combinedExampleName,
+            exampleDescription: combinedExampleDescription,
+            statusCode,
+            contentType: responseContentType,
+            requestBodySchema: rbExample.schema,
+            requestBodyContentType: rbExample.contentType
+          }));
+        });
+      } else if (requestBodyExamplesWithoutKeys.length > 0) {
+        // Single example or schema - use the first one for all response examples
+        const rbExample = requestBodyExamplesWithoutKeys[0];
+        examples.push(createBrunoExample({
+          brunoRequestItem,
+          exampleValue: responseExampleValue,
+          exampleName,
+          exampleDescription,
+          statusCode,
+          contentType: responseContentType,
+          requestBodySchema: rbExample.schema,
+          requestBodyContentType: rbExample.contentType
+        }));
+      } else {
+        // No request body, create example without request body
+        examples.push(createBrunoExample({
+          brunoRequestItem,
+          exampleValue: responseExampleValue,
+          exampleName,
+          exampleDescription,
+          statusCode,
+          contentType: responseContentType
+        }));
+      }
+    };
+
+    if (_operationObject.requestBody && _operationObject.requestBody.content) {
+      Object.entries(_operationObject.requestBody.content).forEach(([contentType, content]) => {
+        if (content.examples) {
+          // Multiple request body examples
+          Object.entries(content.examples).forEach(([exampleKey, example]) => {
+            const exampleValue = example.value !== undefined ? example.value : example;
+            requestBodyExamples.push({
+              key: exampleKey,
+              schema: { example: exampleValue }, // Wrap in schema format for BODY_TYPE_HANDLERS
+              summary: example.summary,
+              description: example.description,
+              contentType: contentType
+            });
+          });
+        } else if (content.example !== undefined) {
+          // Single request body example - wrap in schema-like object
+          requestBodyExamples.push({
+            key: null,
+            schema: { example: content.example }, // Wrap in schema format for BODY_TYPE_HANDLERS
+            summary: null,
+            description: null,
+            contentType: contentType
+          });
+        } else if (content.schema) {
+          // Schema-based request body - pass schema directly
+          requestBodyExamples.push({
+            key: null,
+            schema: content.schema,
+            summary: null,
+            description: null,
+            contentType: contentType
+          });
+        }
+      });
+    }
+
+    // Handle response examples
+    if (_operationObject.responses) {
+      Object.entries(_operationObject.responses).forEach(([statusCode, response]) => {
+        if (response.content) {
+          Object.entries(response.content).forEach(([contentType, content]) => {
+            // Handle examples (plural) - multiple named examples
+            if (content.examples) {
+              Object.entries(content.examples).forEach(([exampleKey, example]) => {
+                const exampleName = example.summary || exampleKey || `${statusCode} Response`;
+                const exampleDescription = example.description || '';
+                const exampleValue = example.value !== undefined ? example.value : example;
+
+                createExamplesWithRequestBody({
+                  responseExampleValue: exampleValue,
+                  exampleName,
+                  exampleDescription,
+                  statusCode,
+                  responseContentType: contentType,
+                  responseExampleKey: exampleKey
+                });
+              });
+            } else if (content.example !== undefined) {
+              // Handle example (singular) at content level
+              const exampleName = `${statusCode} Response`;
+              const exampleDescription = response.description || '';
+
+              createExamplesWithRequestBody({
+                responseExampleValue: content.example,
+                exampleName,
+                exampleDescription,
+                statusCode,
+                responseContentType: contentType
+              });
+            } else if (content.schema) {
+              // Handle schema - extract or generate example from schema
+              const exampleValue = getExampleFromSchema(content.schema);
+              const exampleName = `${statusCode} Response`;
+              const exampleDescription = response.description || '';
+
+              createExamplesWithRequestBody({
+                responseExampleValue: exampleValue,
+                exampleName,
+                exampleDescription,
+                statusCode,
+                responseContentType: contentType
+              });
+            }
+          });
+        } else {
+          // Handle responses without content (e.g., 204 No Content)
+          const exampleName = `${statusCode} Response`;
+          const exampleDescription = response.description || '';
+
+          createExamplesWithRequestBody({
+            responseExampleValue: '',
+            exampleName,
+            exampleDescription,
+            statusCode,
+            responseContentType: null
+          });
+        }
+      });
+    }
+
+    // Only add examples array if there are examples
+    if (examples.length > 0) {
+      brunoRequestItem.examples = examples;
+    }
+  }
+
+  return brunoRequestItem;
+};
+
+// Helper function to validate $ref
+const isValidRef = (ref) => {
+  if (typeof ref !== 'string') {
+    return false;
+  }
+
+  return ref.startsWith('#/components/');
+};
+
+const NAMED_MAPS = new Set([
+  'properties', 'patternProperties', 'definitions', '$defs', 'dependentSchemas', 'schemas', 'responses', 'parameters',
+  'requestBodies', 'headers', 'securitySchemes', 'links', 'callbacks', 'pathItems', 'paths', 'webhooks', 'content',
+  'encoding', 'variables'
+]);
+
+const isReferenceOnly = (value) => isPlainObject(value) && typeof value.$ref === 'string' && Object.keys(value).length === 1;
+
+const isExampleRef = (ref) => isValidRef(ref) && ref.startsWith('#/components/examples/');
+
+const EXAMPLE_DATA_KEYS = ['value', 'dataValue'];
+
+const componentAt = (components, refPath) => refPath
+  .replace('#/components/', '')
+  .split('/')
+  .reduce((node, key) => (node && node[key] ? node[key] : undefined), components);
+
+const EXAMPLE_COPIES = Symbol('exampleCopies');
+
+const exampleDataOf = (example) => EXAMPLE_DATA_KEYS.map((key) => example?.[key]).find((value) => value !== undefined);
+
+const resolveExampleData = (data, components, copies, inlining = []) => {
+  if (!data || typeof data !== 'object') {
+    return data;
+  }
+  if (copies.done.has(data)) {
+    return copies.done.get(data);
+  }
+  if (copies.building.has(data)) {
+    return Array.isArray(data) ? [] : {};
+  }
+  if (isReferenceOnly(data) && isExampleRef(data.$ref) && !inlining.includes(data.$ref)) {
+    const inlined = exampleDataOf(componentAt(components, data.$ref));
+    if (inlined !== undefined) {
+      return resolveExampleData(inlined, components, copies, [...inlining, data.$ref]);
+    }
+  }
+  const copy = Array.isArray(data) ? [] : {};
+  copies.building.add(data);
+  Object.entries(data).forEach(([key, value]) => {
+    copy[key] = resolveExampleData(value, components, copies, inlining);
+  });
+  copies.building.delete(data);
+  copies.done.set(data, copy);
+  return copy;
+};
+
+const exampleCopiesOf = (cache, components) => {
+  if (!cache.has(EXAMPLE_COPIES)) {
+    const copies = { done: new Map(), building: new Set() };
+    cache.set(EXAMPLE_COPIES, copies);
+    Object.values(components?.examples || {}).forEach((example) => resolveExampleData(exampleDataOf(example), components, copies));
+  }
+  return cache.get(EXAMPLE_COPIES);
+};
+
+const resolveExamples = (examples, components, cache) => {
+  if (Array.isArray(examples)) {
+    const values = examples.map((value) => resolveExampleData(value, components, exampleCopiesOf(cache, components))).filter((value) => !isReferenceOnly(value));
+    return values.length > 0 ? values : undefined;
+  }
+  if (!isPlainObject(examples)) {
+    return examples;
+  }
+  const entries = Object.entries(examples)
+    .map(([name, example]) => [name, isValidRef(example?.$ref) && !isExampleRef(example.$ref) ? undefined : resolveRefs(example, components, cache, 'example')])
+    .filter(([, example]) => example !== undefined && !isReferenceOnly(example) && !EXAMPLE_DATA_KEYS.some((key) => isReferenceOnly(example?.[key])));
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+};
+
+const resolveChild = (key, value, components, cache, role) => {
+  if (role === 'map') {
+    return resolveRefs(value, components, cache);
+  }
+  if (role === 'example') {
+    return EXAMPLE_DATA_KEYS.includes(key) ? resolveExampleData(value, components, exampleCopiesOf(cache, components)) : resolveRefs(value, components, cache);
+  }
+  if (key === 'example') {
+    const data = resolveExampleData(value, components, exampleCopiesOf(cache, components));
+    return isReferenceOnly(data) ? undefined : data;
+  }
+  if (key === 'examples') {
+    return resolveExamples(value, components, cache);
+  }
+  return resolveRefs(value, components, cache, NAMED_MAPS.has(key) && isPlainObject(value) ? 'map' : 'object');
+};
+
+function resolveRefs(spec, components = spec?.components, cache = new Map(), role = 'object') {
+  if (!spec || typeof spec !== 'object') {
+    return spec;
+  }
+
+  if (cache.has(spec)) {
+    return cache.get(spec);
+  }
+
+  if (Array.isArray(spec)) {
+    return spec.map((item) => resolveRefs(item, components, cache, role));
+  }
+
+  // Only treat as a JSON reference if it passes all validation checks
+  const isRef = isValidRef(spec.$ref);
+
+  if (isRef) {
+    const refPath = spec.$ref;
+
+    if (cache.has(refPath)) {
+      return cache.get(refPath);
+    }
+
+    if (refPath.startsWith('#/components/')) {
+      const ref = componentAt(components, refPath);
+      if (ref === undefined) {
+        return spec;
+      }
+
+      const placeholder = {};
+      cache.set(refPath, placeholder);
+      const resolved = resolveRefs(ref, components, cache, isExampleRef(refPath) ? 'example' : 'object');
+      cache.set(refPath, resolved);
+      registerReferencePlaceholder(placeholder, resolved);
+      return resolved;
+    }
+    return spec;
+  }
+
+  const resolved = {};
+  cache.set(spec, resolved);
+
+  for (const [key, value] of Object.entries(spec)) {
+    const child = resolveChild(key, value, components, cache, role);
+    if (child !== undefined) {
+      resolved[key] = child;
+    }
+  }
+
+  return resolved;
+}
+
+const getDefaultUrl = (serverObject) => {
+  let url = serverObject.url;
+  if (serverObject.variables) {
+    each(serverObject.variables, (variable, variableName) => {
+      let sub = variable.default !== undefined ? variable.default : (variable.enum ? variable.enum[0] : `{{${variableName}}}`);
+      url = url.replaceAll(`{${variableName}}`, sub);
+    });
+  }
+  return url.endsWith('/') ? url.slice(0, -1) : url;
+};
+
+// Extract { name, value } pairs from an OpenAPI server object.
+// Converts {varName} to {{varName}} for template URLs and includes variable defaults.
+// Placeholders that Bruno fills in itself: process env, secrets providers, OAuth2 credentials and dynamic values
+const RESERVED_VARIABLE_NAME = /^(\$|process(\.|$))/;
+const VARIABLE_NAME = /^[\w-.]+$/;
+
+const extractServerVars = (server) => {
+  const vars = [];
+  if (server.variables && Object.keys(server.variables).length > 0) {
+    let baseUrlTemplate = server.url;
+    each(server.variables, (variable, variableName) => {
+      baseUrlTemplate = baseUrlTemplate.replaceAll(`{${variableName}}`, `{{${variableName}}}`);
+    });
+    baseUrlTemplate = baseUrlTemplate.endsWith('/') ? baseUrlTemplate.slice(0, -1) : baseUrlTemplate;
+    if (baseUrlTemplate !== '{{baseUrl}}') {
+      vars.push({ name: 'baseUrl', value: baseUrlTemplate });
+    }
+    each(server.variables, (variable, variableName) => {
+      let value = variable.default !== undefined ? variable.default : (variable.enum ? variable.enum[0] : '');
+      // Bruno exports secrets and variables without a value with their own placeholder as the default,
+      // so import them as empty secrets
+      const isPlaceholder = value === `{{${variableName}}}`;
+      if (isPlaceholder && RESERVED_VARIABLE_NAME.test(variableName)) return;
+      vars.push({ name: variableName, value: isPlaceholder ? '' : String(value), secret: isPlaceholder });
+    });
+  } else {
+    vars.push({ name: 'baseUrl', value: getDefaultUrl(server) });
+  }
+  return vars;
+};
+
+const getSecurity = (apiSpec) => {
+  let defaultSchemes = apiSpec.security || [];
+  let securitySchemes = get(apiSpec, 'components.securitySchemes', {});
+
+  const hasSchemes = Object.keys(securitySchemes).length > 0;
+
+  return {
+    supported: hasSchemes
+      ? defaultSchemes
+          .map((scheme) => securitySchemes[Object.keys(scheme)[0]])
+          .filter(Boolean)
+      : [],
+    schemes: securitySchemes,
+    getScheme: (schemeName) => (typeof schemeName === 'string' && Object.hasOwn(securitySchemes, schemeName) ? securitySchemes[schemeName] : undefined)
+  };
+};
+
+const buildCollectionAuth = (scheme) => {
+  const authTemplate = {
+    mode: 'none',
+    basic: null,
+    bearer: null,
+    digest: null,
+    apikey: null,
+    oauth2: null
+  };
+
+  if (!scheme) return authTemplate;
+
+  if (scheme.type === 'http' && scheme.scheme === 'basic') {
+    return {
+      ...authTemplate,
+      mode: 'basic',
+      basic: {
+        username: '{{username}}',
+        password: '{{password}}'
+      }
+    };
+  } else if (scheme.type === 'http' && scheme.scheme === 'bearer') {
+    return {
+      ...authTemplate,
+      mode: 'bearer',
+      bearer: {
+        token: '{{token}}'
+      }
+    };
+  } else if (scheme.type === 'http' && scheme.scheme === 'digest') {
+    return {
+      ...authTemplate,
+      mode: 'digest',
+      digest: {
+        username: '{{username}}',
+        password: '{{password}}'
+      }
+    };
+  } else if (scheme.type === 'apiKey') {
+    return {
+      ...authTemplate,
+      mode: 'apikey',
+      apikey: {
+        key: scheme.name,
+        value: '{{apiKey}}',
+        placement: scheme.in === 'query' ? 'queryparams' : 'header'
+      }
+    };
+  } else if (scheme.type === 'oauth2') {
+    let flows = scheme.flows || {};
+    let grantType = 'client_credentials';
+    if (flows.authorizationCode) {
+      grantType = 'authorization_code';
+    } else if (flows.implicit) {
+      grantType = 'implicit';
+    } else if (flows.password) {
+      grantType = 'password';
+    }
+    const flowConfig = grantType === 'authorization_code' ? flows.authorizationCode || {} : grantType === 'implicit' ? flows.implicit || {} : grantType === 'password' ? flows.password || {} : flows.clientCredentials || {};
+
+    return {
+      ...authTemplate,
+      mode: 'oauth2',
+      oauth2: {
+        grantType,
+        authorizationUrl: flowConfig.authorizationUrl || '{{oauth_authorize_url}}',
+        accessTokenUrl: flowConfig.tokenUrl || '{{oauth_token_url}}',
+        refreshTokenUrl: flowConfig.refreshUrl || '{{oauth_refresh_url}}',
+        callbackUrl: '{{oauth_callback_url}}',
+        clientId: '{{oauth_client_id}}',
+        clientSecret: '{{oauth_client_secret}}',
+        scope: Array.isArray(flowConfig.scopes) ? flowConfig.scopes.join(' ') : Object.keys(flowConfig.scopes || {}).join(' '),
+        state: '{{oauth_state}}',
+        credentialsPlacement: 'header',
+        tokenPlacement: 'header',
+        tokenHeaderPrefix: 'Bearer',
+        autoFetchToken: false,
+        autoRefreshToken: true
+      }
+    };
+  }
+  return authTemplate;
+};
+
+const openAPIRuntimeExpressionToScript = (expression) => {
+  // see https://swagger.io/docs/specification/links/#runtime-expressions
+  if (expression === '$response.body') {
+    return 'res.body';
+  } else if (expression.startsWith('$response.body#')) {
+    let pointer = expression.substring(15);
+    // could use https://www.npmjs.com/package/json-pointer for better support
+    return `res.body${pointer.replace('/', '.')}`;
+  }
+  return expression;
+};
+
+export const parseOpenApiCollection = (data, options = {}) => {
+  const usedNames = new Set();
+  const brunoCollection = {
+    name: '',
+    uid: uuid(),
+    version: '1',
+    items: [],
+    environments: []
+  };
+  try {
+    resetExampleGenerationState();
+    const collectionData = resolveRefs(data);
+    if (!collectionData) {
+      throw new Error('Invalid OpenAPI collection. Failed to resolve refs.');
+      return;
+    }
+    registerComponentNames(collectionData.components?.schemas, data.components?.schemas);
+
+    // Currently parsing of openapi spec is "do your best", that is
+    // allows "invalid" openapi spec
+
+    brunoCollection.name = collectionData.info?.title?.trim() || 'Untitled Collection';
+
+    let servers = collectionData.servers || [];
+
+    // Create environments based on the servers. A server's name or description is free text
+    // that becomes the environment's filename, so it needs the same normalization as an
+    // operation name. It also needs a uniqueness guard: unlike requests, environments have
+    // no deduplication, so two servers described alike resolve to one file and the later
+    // one overwrites the earlier.
+    const usedEnvironmentNames = new Set();
+    servers.forEach((server, index) => {
+      const serverLabel = server.name || server.description;
+      let environmentName = serverLabel ? normalizeItemName(serverLabel) : '';
+      if (!environmentName) {
+        environmentName = `Environment ${index + 1}`;
+      }
+      if (usedEnvironmentNames.has(environmentName)) {
+        let counter = 2;
+        while (usedEnvironmentNames.has(`${environmentName} (${counter})`)) {
+          counter++;
+        }
+        environmentName = `${environmentName} (${counter})`;
+      }
+      usedEnvironmentNames.add(environmentName);
+
+      const serverVars = extractServerVars(server);
+      const variables = serverVars.map((sv) => ({
+        uid: uuid(),
+        name: sv.name,
+        value: sv.value,
+        type: 'text',
+        enabled: true,
+        secret: Boolean(sv.secret)
+      }));
+
+      brunoCollection.environments.push({
+        uid: uuid(),
+        name: environmentName,
+        variables
+      });
+    });
+
+    let securityConfig = getSecurity(collectionData);
+
+    // Merge path-item parameters with operation parameters.
+    // Operation parameters override path-item parameters with the same name+in combination.
+    const mergeParams = (pathParams, operationParams) => {
+      const overrides = new Set(operationParams.map((p) => `${p.name}:${p.in}`));
+      const inheritedParams = pathParams.filter((p) => !overrides.has(`${p.name}:${p.in}`));
+      return [...inheritedParams, ...operationParams];
+    };
+
+    let allRequests = Object.entries(collectionData.paths)
+      .map(([path, pathItemObject]) => {
+        // Extract path-item level parameters (per OpenAPI spec, these apply to all operations under this path)
+        const pathItemParams = pathItemObject.parameters || [];
+
+        return Object.entries(pathItemObject)
+          .filter(([method, op]) => {
+            return ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'].includes(
+              method.toLowerCase()
+            );
+          })
+          .reduce((requests, [method, operationObject]) => {
+            const variants = Array.isArray(operationObject['x-bruno-variants']) ? operationObject['x-bruno-variants'] : [];
+            const operations = [operationObject, ...variants.filter((variant) => variant && typeof variant === 'object')];
+
+            operations.forEach((operation) => {
+              const operationObjectCleaned = { ...operation };
+              delete operationObjectCleaned['x-bruno-variants'];
+              const mergedParams = mergeParams(pathItemParams, operationObjectCleaned.parameters || []);
+
+              requests.push({
+                method: method,
+                path: path.replace(/{([^}]+)}/g, ':$1'), // Replace placeholders enclosed in curly braces with colons
+                originalPath: path, // Keep original path for grouping
+                operationObject: { ...operationObjectCleaned, parameters: mergedParams },
+                global: {
+                  server: '{{baseUrl}}',
+                  security: securityConfig
+                },
+                servers: operationObjectCleaned.servers || pathItemObject.servers || null
+              });
+            });
+
+            return requests;
+          }, []);
+      })
+      .reduce((acc, val) => acc.concat(val), []); // flatten
+
+    // A secret in a request's own server has no environment of its own, so add it to every environment
+    const requestServerSecretNames = uniq(
+      allRequests.flatMap((request) => (request.servers?.[0] ? extractServerVars(request.servers[0]) : []))
+        .filter((serverVar) => serverVar.secret && VARIABLE_NAME.test(serverVar.name))
+        .map((serverVar) => serverVar.name)
+    );
+    brunoCollection.environments.forEach((environment) => {
+      requestServerSecretNames
+        .filter((secretName) => !environment.variables.some((variable) => variable.name === secretName))
+        .forEach((secretName) => environment.variables.push({
+          uid: uuid(),
+          name: secretName,
+          value: '',
+          type: 'text',
+          enabled: true,
+          secret: true
+        }));
+    });
+
+    // Support both tag-based and path-based grouping
+    const groupingType = options.groupBy || 'tags';
+    const collectionAuthScheme = options.authPlacement === 'collection'
+      ? resolveCollectionAuthScheme(collectionData.security, allRequests, securityConfig.getScheme, {
+          schemeNames: Object.keys(securityConfig.schemes),
+          toAuth: buildCollectionAuth,
+          collectionAuth: options.collectionAuth
+        })
+      : null;
+    const requestOptions = { ...options, collectionAuthScheme };
+
+    if (groupingType === 'path') {
+      brunoCollection.items = groupRequestsByPath(allRequests, transformOpenapiRequestItem, requestOptions);
+    } else {
+      // Default tag-based grouping
+      let [groups, ungroupedRequests] = groupRequestsByTags(allRequests, options);
+      const tagDescriptions = getTagDescriptions(collectionData.tags, options);
+      let brunoFolders = groups.map((group) => {
+        const folder = {
+          uid: uuid(),
+          name: group.name,
+          type: 'folder',
+          root: {
+            request: {
+              auth: {
+                mode: 'inherit',
+                basic: null,
+                bearer: null,
+                digest: null,
+                apikey: null,
+                oauth2: null
+              }
+            },
+            meta: {
+              name: group.name
+            }
+          },
+          items: group.requests.map((req) => transformOpenapiRequestItem(req, usedNames, requestOptions))
+        };
+        const docs = tagDescriptions[group.name];
+        if (docs) {
+          folder.root.docs = docs;
+        }
+        return folder;
+      });
+
+      const ungroupedItems = ungroupedRequests.map((req) => transformOpenapiRequestItem(req, usedNames, requestOptions));
+      let brunoCollectionItems = brunoFolders.concat(ungroupedItems);
+      brunoCollection.items = brunoCollectionItems;
+    }
+
+    // Determine collection-level authentication based on global security requirements
+    const collectionAuth = buildCollectionAuth(collectionAuthScheme ? collectionAuthScheme.scheme : securityConfig.supported[0]);
+
+    brunoCollection.root = {
+      request: {
+        auth: collectionAuth
+      },
+      meta: {
+        name: brunoCollection.name
+      },
+      docs: toSpecString(collectionData.info?.description)
+    };
+
+    return brunoCollection;
+  } catch (err) {
+    if (!(err instanceof Error)) {
+      throw new Error('Unknown error');
+    }
+    throw err;
+  }
+};
+
+export const openApiToBruno = (openApiSpecification, options = {}) => {
+  try {
+    if (typeof openApiSpecification !== 'object') {
+      openApiSpecification = jsyaml.load(openApiSpecification);
+    }
+    if (openApiSpecification.swagger && String(openApiSpecification.swagger).startsWith('2')) {
+      return swagger2ToBruno(openApiSpecification, options);
+    }
+
+    const collection = parseOpenApiCollection(openApiSpecification, options);
+
+    const transformedCollection = transformItemsInCollection(collection);
+
+    const hydratedCollection = hydrateSeqInCollection(transformedCollection);
+    const validatedCollection = validateSchema(hydratedCollection);
+
+    return validatedCollection;
+  } catch (err) {
+    console.error('Error converting OpenAPI to Bruno:', err);
+    if (!(err instanceof Error)) {
+      throw new Error('Unknown error');
+    }
+    throw err;
+  }
+};
+
+export default openApiToBruno;
